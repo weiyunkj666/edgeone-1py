@@ -90,9 +90,13 @@ is_eo=NO
 [ -n "$fp" ] && [ "$fp" = "$efp" ] && is_eo=YES
 case "$svr" in *TencentEdgeOne*) is_eo=YES ;; esac
 
-verdict="NO"
-if [ "$is_eo" = "YES" ]; then
-	if [ "$code" = "200" ] && [ "$mark" = "YES" ]; then verdict="OK"; else verdict="EDGE-ONLY"; fi
+# 主判据是"能否承载你的域名"；指纹/Server 只是辅助信息（避免误杀）
+if [ "$code" = "200" ] && [ "$mark" = "YES" ]; then
+	verdict="OK"
+elif [ "$is_eo" = "YES" ]; then
+	verdict="EDGE-ONLY"
+else
+	verdict="NO"
 fi
 printf '%s\t%s\t%s\t%s/%s\t%s\t%s\n' "$ip" "${fp:0:16}" "${svr:--}" "$code" "$mark" "$verdict" "$code_ip" >> "$out"
 WEOF
