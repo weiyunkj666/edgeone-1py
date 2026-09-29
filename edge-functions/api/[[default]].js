@@ -1,20 +1,19 @@
 /**
- * EdgeOne Pages / Makers — Edge Function 反向代理中转
- * 用途：把 https://你的域名/api/xxx 透明转发到 UPSTREAM 指向的 Xray 后端
- *       （适配 XHTTP 的 packet-up 模式，对普通 HTTP/HTTPS 请求同样有效）
+ * EdgeOne Pages / Makers — 反向代理中转（Edge Function）
  *
- * 路由：edge-functions/api/[[default]].js -> 匹配 /api/*（含多级子路径）
+ * 位置：edge-functions/api/[[default]].js，映射 /api/* 路由，采用「具名导出 onRequest」。
+ * 重要：不要把 catch-all 放到 edge-functions/ 根级——它与 api/[[default]].js 同时存在时，
+ *       平台的路由解析会异常，导致 /api/* 直接返回空 body 的 404（已实测复现）。
+ * 平台不会剥掉 /api 前缀：函数内看到的就是 /api/session，由本文件自行剥离。
  *
- * 必需环境变量（EdgeOne 控制台 → 项目 → 环境变量）：
- *   UPSTREAM   你的后端地址，例如 https://1.2.3.4:8443 或 https://origin.example.com
- *              注意：Pages 不支持回源 IPv6，请填 IPv4 或 A 记录域名
- *   HOST       转发时使用的 Host 头（Xray 服务端按域名分流/伪装校验用）
+ * 环境变量：
+ *   UPSTREAM      后端地址，如 https://1.2.3.4:8443（不支持回源 IPv6，必须 IPv4 或 A 记录域名）
+ *   HOST          转发时写回给后端的 Host 头（Xray 服务端分流/伪装校验用）
+ *   STRIP_PREFIX  默认 "1"：客户端 /api/session -> 后端 /session；设 "0" 保留完整路径
+ *   AUTH_TOKEN    若设置，转发时附加 x-relay-token 头
+ *   DEBUG         设 "1" 时响应附加 x-debug-* 诊断头
  *
- * 可选环境变量：
- *   STRIP_PREFIX   默认 "1"：转发时去掉开头的 /api（客户端 /api/session -> 后端 /session）
- *                  设为 "0" 则保留完整路径（后端也会看到 /api/session）
- *   AUTH_TOKEN     若设置，转发时附加 x-relay-token 头，后端可校验，防止中转被白嫖
- *   DEBUG          设为 "1" 时，响应附加 x-debug-* 诊断头
+ * 自检：GET /api/__health 返回中转运行状态（不访问后端）
  */
 
 const HOP_BY_HOP = new Set([
@@ -23,9 +22,9 @@ const HOP_BY_HOP = new Set([
   'keep-alive',
   'transfer-encoding',
   'upgrade',
-  'host',                 // 由目标 URL / HOST 变量决定
-  'content-length',       // 交给 fetch 按实际 body 重新计算
-  'accept-encoding',      // 让平台自行协商压缩，避免解压后贴上错误的编码头
+  'host',
+  'content-length',
+  'accept-encoding',
   'te',
   'trailer',
   'proxy-authorization',
@@ -41,7 +40,7 @@ const HOP_BY_HOP = new Set([
 
 const API_PREFIX = '/api';
 
-/** 环境变量取值：优先用 context.env（Makers/Pages 推荐方式），再退回 process.env */
+/** 环境变量取值：优先 context.env，再退回 process.env（Node 测试环境） */
 function getEnv(context, key) {
   const e = (context && context.env) || {};
   if (e[key] !== undefined && e[key] !== null && e[key] !== '') return String(e[key]);
@@ -61,21 +60,40 @@ function stripPrefix(pathname, keep) {
   return pathname || '/';
 }
 
-export default function onRequest(context) {
-  return handle(context).catch((err) => new Response(JSON.stringify({
-    ok: false,
-    error: String((err && err.message) || err),
-    hint: '检查 UPSTREAM 环境变量与后端可达性（后端不支持 IPv6 回源）',
-  }, null, 2), {
-    status: 502,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-  }));
+function json(status, body) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-relay': 'edgeone-xray-relay',
+    },
+  });
 }
 
 async function handle(context) {
   const request = context.request;
-  const origin = upstreamOf(context);
   const debug = getEnv(context, 'DEBUG') === '1';
+  const inUrl = new URL(request.url);
+  // 平台会先剥掉 /api 前缀，这里再兜一层，兼容直接带 /api 调用的情况
+  const path = stripPrefix(inUrl.pathname, getEnv(context, 'STRIP_PREFIX') === '0');
+  const origin = upstreamOf(context);
+
+  // ---- 自检端点：证明函数被真正执行（不碰后端） ----
+  if (inUrl.pathname === '/__health' || path === '/__health') {
+    return json(200, {
+      ok: true,
+      relay: 'edgeone-xray-relay/edge',
+      runtime: typeof caches === 'undefined' ? 'unknown' : 'worker',
+      hasUpstream: !!origin,
+      upstream: origin ? origin.replace(/(:\/\/[^/]+).*/, '$1') : null,
+      host: getEnv(context, 'HOST') || null,
+      stripPrefix: getEnv(context, 'STRIP_PREFIX') !== '0',
+      seenPath: inUrl.pathname,
+      forwardedPath: path,
+      clientIp: context.clientIp || null,
+    });
+  }
 
   if (!origin) {
     return json(500, {
@@ -85,14 +103,10 @@ async function handle(context) {
     });
   }
 
-  const inUrl = new URL(request.url);
-  const path = stripPrefix(inUrl.pathname, getEnv(context, 'STRIP_PREFIX') === '0');
-
   // 目标 URL：路径 + 原始查询串（XHTTP 的 x_padding 等参数必须原样保留）
   const target = new URL(origin + path);
   if (inUrl.search) target.search = inUrl.search;
 
-  // 组装回源请求头
   const headers = new Headers();
   for (const [k, v] of request.headers) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) headers.set(k, v);
@@ -111,26 +125,23 @@ async function handle(context) {
   const method = request.method.toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD';
 
-  // 流式回源，不把 body 读进内存
   const resp = await fetch(target.toString(), {
     method,
     headers,
     body: hasBody ? request.body : undefined,
-    redirect: 'manual',   // 保留后端返回的 3xx
+    redirect: 'manual',
   });
 
-  // 组装响应：剔除逐跳头
   const outHeaders = new Headers();
   for (const [k, v] of resp.headers) {
     if (HOP_BY_HOP.has(k.toLowerCase())) continue;
     outHeaders.set(k, v);
   }
   outHeaders.set('cache-control', 'no-store, no-cache, must-revalidate');
+  outHeaders.set('x-relay', 'edgeone-xray-relay');
   if (debug) {
     outHeaders.set('x-debug-upstream', target.toString());
     outHeaders.set('x-debug-status', String(resp.status));
-    outHeaders.set('x-debug-ct', resp.headers.get('content-type') || '');
-    outHeaders.set('x-debug-client-ip', clientIp);
   }
 
   return new Response(resp.body, {
@@ -140,9 +151,18 @@ async function handle(context) {
   });
 }
 
-function json(status, body) {
-  return new Response(JSON.stringify(body, null, 2), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-  });
+/** 统一的入口封装：任何异常都返回可读原因，方便排障 */
+function entry(context) {
+  return handle(context).catch((err) => json(502, {
+    ok: false,
+    error: String((err && err.message) || err),
+    hint: '检查 UPSTREAM 是否可达（不支持 IPv6 回源）、端口与证书是否正确',
+  }));
 }
+
+// EdgeOne Pages Edge Function：具名导出 onRequest（平台上已验证可用的写法）
+export function onRequest(context) {
+  return entry(context);
+}
+
+export default onRequest;
