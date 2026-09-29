@@ -81,7 +81,9 @@ detect_tokens() {
 	done
 	for f in "$HOME/ips1.bash" "$HOME/ips.bash" "./ips1.bash" "./ips.bash"; do
 		[ -s "$f" ] || continue
-		t=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?IPINFO_TOKEN=' "$f" 2>/dev/null | sed -e 's/^[^=]*=//' -e "s/[\"']//g" | tr -d ' \t\r')
+		t=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?IPINFO_TOKEN=' "$f" 2>/dev/null \
+			| sed -e 's/^[^=]*=//' -e "s/[\"']//g" -e 's/^${[^:]*:-//' -e 's/}$//' | tr -d ' \t\r')
+		case "$t" in *'$'*|*'{'*|*'}'*) t="" ;; esac
 		[ -n "$t" ] && { printf '%s' "$t"; return; }
 	done
 }
