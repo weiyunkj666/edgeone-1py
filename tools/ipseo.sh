@@ -22,6 +22,11 @@
 #   ipseo -t 64 -n 2000 -D 20 -u <你的UUID> /root/3-9.txt /root/ips20260301.txt
 #
 # 环境变量同名可覆盖默认值: EO_DOMAIN / EO_PORT / EO_PATH / EO_MARKER / EO_THREADS 等
+#
+# ⚠️ 并发调优（实测教训）:
+#   同网段大量 IP 一起打时，线程给太猛会让连接饱和、把正常 IP 误判成失败。
+#   实测同一段 508 个 IP: 40 线程 -> 只命中 5 个;  8 线程 -> 命中 507 个。
+#   建议 -t 8~16；大列表先切小段跑，或分级: 先 -c 2 -M 4 粗筛，再对通过者细测。
 # ============================================================
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; CYAN=$'\033[0;36m'
@@ -32,7 +37,7 @@ PORT="${EO_PORT:-443}"
 RQPATH="${EO_PATH:-/api/__health}"
 MARKER="${EO_MARKER:-edgeone-xray-relay}"
 SERVER_X="${EO_SERVER:-edgeone makers}"
-THREADS="${EO_THREADS:-32}"
+THREADS="${EO_THREADS:-12}"
 CTMO="${EO_CONNECT_TIMEOUT:-4}"
 TMO="${EO_MAX_TIME:-8}"
 MAX_CIDR="${MAX_CIDR_IPS:-4096}"
