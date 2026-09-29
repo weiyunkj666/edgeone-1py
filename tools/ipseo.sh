@@ -2,6 +2,8 @@
 # ============================================================
 #  ipseo — EdgeOne 中转 IP 扫描 / 优选
 #
+#  v1.4  扫描过程中实时打印命中的 IP（终端彩色+进度条；重定向则纯文本行）
+#
 #  两种用法：
 #   1) 直接运行  ipseo            → 交互模式（列出 .txt 让你选，和你原来的 ips 一样）
 #   2) 带参数     ipseo 文件 [选项] → 命令行模式（可放进 crontab / 批量调用）
@@ -182,7 +184,7 @@ PYEOF
 scan() {
 	cat > "$TMPD/w.sh" <<'WEOF'
 #!/bin/bash
-ip="$1"; domain="$2"; port="$3"; path="$4"; marker="$5"; ct="$6"; mt="$7"; ua="$8"; hits="$9"; donef="${10}"; insecure="${11}"
+ip="$1"; domain="$2"; port="$3"; path="$4"; marker="$5"; ct="$6"; mt="$7"; ua="$8"; hits="$9"; donef="${10}"; insecure="${11}"; live="${12}"
 opts=(-sS --resolve "${domain}:${port}:${ip}" --connect-timeout "$ct" --max-time "$mt" -A "$ua")
 [ "$insecure" = "1" ] && opts+=(-k)
 hdr=$(mktemp); body=$(mktemp)
@@ -196,6 +198,10 @@ if [ "$ok" = "1" ]; then
 	flock 9
 	printf '%s\t%s\t%s\t%s\n' "$ip" "$tot" "$tls" "$svr" >> "$hits"
 	flock -u 9
+case "$live" in
+	1) printf '\r  \033[0;32m✔ 命中\033[0m  %-16s %8ss  %-24s\033[K\n' "$ip" "$tot" "$svr" ;;
+	2) printf '  命中  %-16s %8ss  %s\n' "$ip" "$tot" "$svr" ;;
+esac
 fi
 rm -f "$hdr" "$body"
 echo -n x >> "$donef"
@@ -203,10 +209,28 @@ WEOF
 	chmod +x "$TMPD/w.sh"
 	UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 	HITS="$TMPD/hits.tsv"; DONE="$TMPD/done.cnt"; : > "$HITS"; : > "$DONE"
-	[ "$QUIET" -eq 0 ] && echo "  开始扫描 ${BOLD}${TOTAL}${NC} 个 IP，线程 ${THREADS} ..."
+	LIVE=1
+	if [ "$QUIET" -eq 1 ] || [ "$LISTONLY" -eq 1 ]; then LIVE=0
+	elif [ ! -t 1 ]; then LIVE=2; fi
+	[ "$LIVE" != "0" ] && echo "  开始扫描 ${BOLD}${TOTAL}${NC} 个 IP，线程 ${THREADS} 个并发 ...（命中会实时打印，Ctrl+C 可中断）"
 	START=$(date +%s)
+	PROG_PID=""
+	if [ "$LIVE" = "1" ]; then
+		( while :; do
+			d=$(wc -c < "$DONE" 2>/dev/null | tr -d ' ')
+			h=$(grep -c . "$HITS" 2>/dev/null || echo 0)
+			el=$(( $(date +%s) - START ))
+			eta="--"
+			[ "${d:-0}" -gt 0 ] && eta=$(( (TOTAL - d) * el / d ))s
+			printf '\r  进度 %s/%s (%s%%)  命中 %s  已用 %ss  ETA %s\033[K' "${d:-0}" "$TOTAL" "$(( TOTAL > 0 ? ${d:-0} * 100 / TOTAL : 0 ))" "$h" "$el" "$eta"
+			sleep 1
+			[ "${d:-0}" -ge "$TOTAL" ] && break
+		done ) &
+		PROG_PID=$!
+	fi
 	xargs -a "$TMPD/scan.txt" -P "$THREADS" -I{} bash "$TMPD/w.sh" \
-		{} "$DOMAIN" "$PORT" "$RQPATH" "$MARKER" "$CTMO" "$TMO" "$UA" "$HITS" "$DONE" "$INSECURE" 9>"$TMPD/hits.lock"
+		{} "$DOMAIN" "$PORT" "$RQPATH" "$MARKER" "$CTMO" "$TMO" "$UA" "$HITS" "$DONE" "$INSECURE" "$LIVE" 9>"$TMPD/hits.lock"
+	[ -n "$PROG_PID" ] && { kill "$PROG_PID" 2>/dev/null; wait "$PROG_PID" 2>/dev/null; printf '\r%*s\r' 90 ''; }
 	ELAPSED=$(( $(date +%s) - START ))
 	SORTED="$TMPD/sorted.tsv"
 	sort -n -t$'\t' -k2,2 "$HITS" > "$SORTED" 2>/dev/null || cp "$HITS" "$SORTED"
