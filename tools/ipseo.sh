@@ -2,6 +2,7 @@
 # ============================================================
 #  ipseo — EdgeOne 中转 IP 扫描 / 优选
 #
+#  v1.5  命中后自动查 ipinfo 归属地/运营商（-T 传 token，或用 ~/.ipseo-tokens / $IPINFO_TOKEN）
 #  v1.4  扫描过程中实时打印命中的 IP（终端彩色+进度条；重定向则纯文本行）
 #
 #  两种用法：
@@ -17,6 +18,7 @@
 #   -d 域名   -p 端口   -P 路径   -m 标记   -t 线程
 #   -c 连接超时   -M 总超时   -n 限量   -D 深检条数   -u UUID
 #   -o 输出目录   -k 跳过证书校验   -L 只输出IP   -q 安静
+#   -T ipinfo token(逗号分隔多个; -T - 关闭归属地)   -h 帮助
 # ============================================================
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; CYAN=$'\033[0;36m'
@@ -33,6 +35,7 @@ MAX_CIDR="${MAX_CIDR_IPS:-4096}"
 OUTDIR="${EO_OUTDIR:-/root}"
 UUID="${EO_UUID:-}"
 LIMIT=0; DEEP=0; QUIET=0; INSECURE=0; LISTONLY=0
+GEO_TOK=""
 FILES=()
 
 # ---------------- 参数解析 ----------------
@@ -53,6 +56,7 @@ parse_args() {
 			-k) INSECURE=1; shift ;;
 			-L) LISTONLY=1; shift ;;
 			-q) QUIET=1; shift ;;
+			-T) GEO_TOK="$2"; shift 2 ;;
 			-h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) FILES+=("$1"); shift ;;
 		esac
@@ -64,6 +68,30 @@ ask() {  # ask 变量名 "提示" "默认值"
 	printf "  %s ${BOLD}[%s]${NC}: " "$__p" "$__d"
 	read -r __in
 	eval "$__v=\${__in:-$__d}"
+}
+
+# ipinfo token 自动探测: -T 参数 > $IPINFO_TOKEN > ~/.ipseo-tokens > ~/ips1.bash
+detect_tokens() {
+	local t="" f
+	[ -n "${IPINFO_TOKEN:-}" ] && { printf '%s' "$IPINFO_TOKEN"; return; }
+	for f in "$HOME/.ipseo-tokens" "$HOME/.ipinfo-tokens"; do
+		[ -s "$f" ] || continue
+		t=$(tr '\n' ',' < "$f" | tr -s ',' | sed 's/^,//; s/,$//')
+		[ -n "$t" ] && { printf '%s' "$t"; return; }
+	done
+	for f in "$HOME/ips1.bash" "$HOME/ips.bash" "./ips1.bash" "./ips.bash"; do
+		[ -s "$f" ] || continue
+		t=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?IPINFO_TOKEN=' "$f" 2>/dev/null | sed -e 's/^[^=]*=//' -e "s/[\"']//g" | tr -d ' \t\r')
+		[ -n "$t" ] && { printf '%s' "$t"; return; }
+	done
+}
+
+geo_state() {
+	if [ -n "${GEO_TOK:-}" ] && [ "$GEO_TOK" != "-" ]; then
+		printf '开启 (ipinfo, %s 个token)' "$(printf '%s' "$GEO_TOK" | tr ',' '\n' | grep -c .)"
+	else
+		printf '关闭'
+	fi
 }
 
 interactive() {
@@ -134,12 +162,14 @@ interactive() {
 	ask TMO      "单次总超时秒" "$TMO"
 	ask DEEP     "深检条数 (对最快N个验证回源, 0=跳过)" "$DEEP"
 	ask UUID     "UUID (选填, 填了会生成 v2rayNG 链接)" "$UUID"
+	ask GEO_TOK  "ipinfo token (逗号分隔多个; 回车=不查归属地)" "$GEO_TOK"
 	ask OUTDIR   "输出目录" "$OUTDIR"
 	ask LIMIT    "随机抽样数量 (0=全部)" "$LIMIT"
 	echo "${CYAN}------------------------------------------------------------${NC}"
 	echo "  域名 : ${BOLD}$DOMAIN${NC}   端口: ${BOLD}$PORT${NC}   路径: ${BOLD}$RQPATH${NC}"
 	echo "  标记 : ${BOLD}$MARKER${NC}   线程: ${BOLD}$THREADS${NC}   超时: 连接${CTMO}s/总${TMO}s"
 	echo "  文件 : ${#FILES[@]} 个   深检: ${DEEP}   输出: ${OUTDIR}"
+	echo "  归属地: $(geo_state)"
 	echo
 	printf "  ${BOLD}回车开始扫描${NC} (Ctrl+C 取消)..."; read -r
 }
@@ -184,7 +214,7 @@ PYEOF
 scan() {
 	cat > "$TMPD/w.sh" <<'WEOF'
 #!/bin/bash
-ip="$1"; domain="$2"; port="$3"; path="$4"; marker="$5"; ct="$6"; mt="$7"; ua="$8"; hits="$9"; donef="${10}"; insecure="${11}"; live="${12}"
+ip="$1"; domain="$2"; port="$3"; path="$4"; marker="$5"; ct="$6"; mt="$7"; ua="$8"; hits="$9"; donef="${10}"; insecure="${11}"; live="${12}"; geotok="${13}"; tmpd="${14}"
 opts=(-sS --resolve "${domain}:${port}:${ip}" --connect-timeout "$ct" --max-time "$mt" -A "$ua")
 [ "$insecure" = "1" ] && opts+=(-k)
 hdr=$(mktemp); body=$(mktemp)
@@ -194,14 +224,65 @@ code="${w%%|*}"; r="${w#*|}"; tls="${r%%|*}"; tot="${r#*|}"
 ok=0
 [ "$code" = "200" ] && grep -qF -- "$marker" "$body" 2>/dev/null && ok=1
 svr=$(grep -i '^server:' "$hdr" 2>/dev/null | head -1 | cut -d' ' -f2- | tr -d '\r')
+region="-"; city="-"; country="-"; org="-"; isp="-"; geostr=""
+if [ "$ok" = "1" ] && [ -n "$geotok" ] && [ "$geotok" != "-" ] && [ ! -f "${tmpd}/geo.off" ]; then
+	IFS=',' read -r -a TOKA <<< "$geotok"
+	nt=${#TOKA[@]}; [ "$nt" -le 0 ] && nt=1
+	info=""
+	for attempt in 1 2; do
+		idx=$(( ( ${ip##*.} + attempt ) % nt ))
+		tok="${TOKA[$idx]}"
+		if [ -n "$tok" ]; then u="https://ipinfo.io/${ip}?token=${tok}"; else u="https://ipinfo.io/${ip}"; fi
+		info=$(curl -s --connect-timeout 3 --max-time 4 "$u" 2>/dev/null)
+		if [ -n "$info" ] && ! printf '%s' "$info" | grep -q '"error"'; then break; fi
+		info=""; sleep 1
+	done
+	if [ -n "$info" ]; then
+		jf() { printf '%s' "$2" | tr -d '\n\r' | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1 | tr -d '\t'; }
+		region=$(jf region "$info"); city=$(jf city "$info"); country=$(jf country "$info"); org=$(jf org "$info")
+		[ -z "$region" ] && region="-"; [ -z "$city" ] && city="-"
+		[ -z "$country" ] && country="-"; [ -z "$org" ] && org="-"
+		if [ "$region" = "-" ] && [ "$city" = "-" ] && [ "$country" = "-" ] && [ "$org" = "-" ]; then info=""; fi
+	fi
+	if [ -n "$info" ]; then
+		case "$org" in
+			*[Tt]encent*) isp="腾讯云" ;;
+			*[Aa]libaba*|*aliyun*) isp="阿里云" ;;
+			*"China Telecom"*|*CHINANET*|*Chinanet*) isp="电信" ;;
+			*Unicom*|*UNICOM*) isp="联通" ;;
+			*"China Mobile"*|*CMNET*|*CMCC*) isp="移动" ;;
+			*Huawei*) isp="华为云" ;;
+			*) isp="其他" ;;
+		esac
+		loc="${region}/${city}"
+		[ "$country" = "CN" ] || loc="${country}:${loc}"
+		geostr="${loc} ${isp}"
+		flock 9; echo -n x >> "${tmpd}/geo.ok"; flock -u 9
+	else
+		region="-"; city="-"; country="-"; org="-"; isp="-"
+		flock 9
+		echo -n x >> "${tmpd}/geo.fail"
+		gf=$(wc -c < "${tmpd}/geo.fail" 2>/dev/null | tr -d ' ')
+		gs=$(wc -c < "${tmpd}/geo.ok" 2>/dev/null | tr -d ' ')
+		flock -u 9
+		[ "${gf:-0}" -ge 6 ] && [ "${gs:-0}" -eq 0 ] && touch "${tmpd}/geo.off"
+	fi
+fi
 if [ "$ok" = "1" ]; then
 	flock 9
-	printf '%s\t%s\t%s\t%s\n' "$ip" "$tot" "$tls" "$svr" >> "$hits"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ip" "$tot" "$tls" "$svr" "$region" "$city" "$country" "$org" "$isp" >> "$hits"
 	flock -u 9
-case "$live" in
-	1) printf '\r  \033[0;32m✔ 命中\033[0m  %-16s %8ss  %-24s\033[K\n' "$ip" "$tot" "$svr" ;;
-	2) printf '  命中  %-16s %8ss  %s\n' "$ip" "$tot" "$svr" ;;
-esac
+	if [ -n "$geostr" ]; then
+		case "$live" in
+			1) printf '\r  \033[0;32m✔ 命中\033[0m  %-16s %8ss  %-20s %s\033[K\n' "$ip" "$tot" "$svr" "$geostr" ;;
+			2) printf '  命中  %-16s %8ss  %-20s %s\n' "$ip" "$tot" "$svr" "$geostr" ;;
+		esac
+	else
+		case "$live" in
+			1) printf '\r  \033[0;32m✔ 命中\033[0m  %-16s %8ss  %-24s\033[K\n' "$ip" "$tot" "$svr" ;;
+			2) printf '  命中  %-16s %8ss  %s\n' "$ip" "$tot" "$svr" ;;
+		esac
+	fi
 fi
 rm -f "$hdr" "$body"
 echo -n x >> "$donef"
@@ -209,10 +290,11 @@ WEOF
 	chmod +x "$TMPD/w.sh"
 	UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 	HITS="$TMPD/hits.tsv"; DONE="$TMPD/done.cnt"; : > "$HITS"; : > "$DONE"
+	: > "$TMPD/geo.ok"; : > "$TMPD/geo.fail"; rm -f "$TMPD/geo.off"
 	LIVE=1
 	if [ "$QUIET" -eq 1 ] || [ "$LISTONLY" -eq 1 ]; then LIVE=0
 	elif [ ! -t 1 ]; then LIVE=2; fi
-	[ "$LIVE" != "0" ] && echo "  开始扫描 ${BOLD}${TOTAL}${NC} 个 IP，线程 ${THREADS} 个并发 ...（命中会实时打印，Ctrl+C 可中断）"
+	[ "$LIVE" != "0" ] && echo "  开始扫描 ${BOLD}${TOTAL}${NC} 个 IP，线程 ${THREADS} 个并发 ...（命中即时打印，Ctrl+C 可中断）  归属地: $(geo_state)"
 	START=$(date +%s)
 	PROG_PID=""
 	if [ "$LIVE" = "1" ]; then
@@ -229,8 +311,11 @@ WEOF
 		PROG_PID=$!
 	fi
 	xargs -a "$TMPD/scan.txt" -P "$THREADS" -I{} bash "$TMPD/w.sh" \
-		{} "$DOMAIN" "$PORT" "$RQPATH" "$MARKER" "$CTMO" "$TMO" "$UA" "$HITS" "$DONE" "$INSECURE" "$LIVE" 9>"$TMPD/hits.lock"
+		{} "$DOMAIN" "$PORT" "$RQPATH" "$MARKER" "$CTMO" "$TMO" "$UA" "$HITS" "$DONE" "$INSECURE" "$LIVE" "$GEO_TOK" "$TMPD" 9>"$TMPD/hits.lock"
 	[ -n "$PROG_PID" ] && { kill "$PROG_PID" 2>/dev/null; wait "$PROG_PID" 2>/dev/null; printf '\r%*s\r' 90 ''; }
+	if [ -f "$TMPD/geo.off" ] && [ "$LIVE" != "0" ]; then
+		echo "  ${YELLOW}[!] ipinfo 连续查询失败，本次已跳过归属地（检查网络或 token 是否有效）${NC}"
+	fi
 	ELAPSED=$(( $(date +%s) - START ))
 	SORTED="$TMPD/sorted.tsv"
 	sort -n -t$'\t' -k2,2 "$HITS" > "$SORTED" 2>/dev/null || cp "$HITS" "$SORTED"
@@ -238,6 +323,16 @@ WEOF
 }
 
 # ---------------- 输出 ----------------
+# 归属地单元格: 国内显示 省/市 运营商；境外显示 国家:省/市 运营商
+geo_cell() {
+	if [ -z "$1" ] || [ "$1" = "-" ]; then printf '-'; return; fi
+	if [ "$3" = "CN" ] || [ -z "$3" ] || [ "$3" = "-" ]; then
+		printf '%s/%s %s' "$1" "$2" "${4:--}"
+	else
+		printf '%s:%s/%s %s' "$3" "$1" "$2" "${4:--}"
+	fi
+}
+
 report() {
 	TS=$(date +%Y%m%d-%H%M%S)
 	mkdir -p "$OUTDIR"
@@ -246,12 +341,18 @@ report() {
 		echo "域名: $DOMAIN   端口: $PORT   路径: $RQPATH"
 		echo "标记: $MARKER   线程: $THREADS   证书校验: $([ "$INSECURE" -eq 1 ] && echo 关闭 || echo 开启)"
 		echo "时间: $(date '+%F %T')   输入合计: $TOTAL_ALL   实际扫描: $TOTAL   可用: $HITN   耗时: ${ELAPSED}s"
+		echo "归属地: $(geo_state)"
 		echo ""
-		printf "%-16s %-10s %-10s %s\n" "IP" "总耗时(s)" "TLS(s)" "Server"
-		echo "----------------|----------|----------|--------------------"
-		while IFS=$'\t' read -r ip tot tls svr; do printf "%-16s %-10s %-10s %s\n" "$ip" "$tot" "$tls" "$svr"; done < "$SORTED"
+		printf "%-16s %-10s %-10s %-24s %s\n" "IP" "总耗时(s)" "TLS(s)" "Server" "归属地(ipinfo)"
+		echo "----------------|----------|----------|------------------------|-----------------------------------"
+		while IFS=$'\t' read -r ip tot tls svr region city country org isp; do printf "%-16s %-10s %-10s %-24s %s\n" "$ip" "$tot" "$tls" "$svr" "$(geo_cell "$region" "$city" "$country" "$isp")"; done < "$SORTED"
 	} > "$OUT"
-	awk -F'\t' 'BEGIN{print "ip,total_s,tls_s,server"}{print $1","$2","$3","$4}' "$SORTED" > "${OUT%.*}.csv"
+	{
+		echo "ip,total_s,tls_s,server,region,city,country,org,isp"
+		while IFS=$'\t' read -r ip tot tls svr region city country org isp; do
+			printf '%s,%s,%s,%s,%s,%s,%s,"%s",%s\n' "$ip" "$tot" "$tls" "$svr" "$region" "$city" "$country" "$org" "$isp"
+		done < "$SORTED"
+	} > "${OUT%.*}.csv"
 
 	if [ "$LISTONLY" -eq 1 ]; then cut -f1 "$SORTED"; return; fi
 
@@ -260,10 +361,13 @@ report() {
 	echo "  可用 IP: ${BOLD}${HITN}${NC} / ${TOTAL}    耗时 ${ELAPSED}s"
 	echo "${GREEN}============================================================${NC}"
 	if [ "$HITN" -gt 0 ]; then
-		printf "  %-16s %-10s %s\n" "IP" "延迟(s)" "Server"
-		echo "  ---------------- ---------- --------------------"
-		head -n 25 "$SORTED" | while IFS=$'\t' read -r ip tot tls svr; do printf "  %-16s %-10s %s\n" "$ip" "$tot" "$svr"; done
+		printf "  %-16s %-9s %-20s %s\n" "IP" "延迟(s)" "Server" "归属地 / 运营商"
+		echo "  ---------------- --------- -------------------- ------------------------------------"
+		head -n 25 "$SORTED" | while IFS=$'\t' read -r ip tot tls svr region city country org isp; do printf "  %-16s %-9s %-20s %s\n" "$ip" "$tot" "$svr" "$(geo_cell "$region" "$city" "$country" "$isp")"; done
 		[ "$HITN" -gt 25 ] && echo "  ...（完整 $HITN 条见 $OUT）"
+		if [ -n "${GEO_TOK:-}" ] && [ "$GEO_TOK" != "-" ]; then
+			echo "  运营商分布: $(awk -F'\t' '$9!="-" && $9!="" {c[$9]++} END{for(k in c) printf "%s %d  ", k, c[k]}' "$SORTED")"
+		fi
 	else
 		echo "  ${YELLOW}没有可用 IP。常见原因：${NC}"
 		echo "   1) 这批 IP 不承载该域名（换 -d 域名，或换项目的对应池子）"
@@ -309,6 +413,8 @@ for dep in curl awk sort; do
 	command -v "$dep" >/dev/null 2>&1 || { echo "${RED}[x] 缺少依赖: $dep${NC}" >&2; exit 1; }
 done
 
+[ -n "${EO_GEO_TOK:-}" ] && GEO_TOK="$EO_GEO_TOK"
+[ -z "$GEO_TOK" ] && GEO_TOK="$(detect_tokens)"
 if [ $# -eq 0 ]; then interactive; else parse_args "$@"; fi
 [ ${#FILES[@]} -eq 0 ] && { echo "${RED}[x] 没选文件${NC}" >&2; exit 1; }
 
