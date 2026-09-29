@@ -79,9 +79,9 @@ async function handle(context) {
   const path = stripPrefix(inUrl.pathname, getEnv(context, 'STRIP_PREFIX') === '0');
   const origin = upstreamOf(context);
 
-  // ---- 自检端点：证明函数被真正执行（不碰后端） ----
+  // ---- 自检端点：证明函数被真正执行 ----
   if (inUrl.pathname === '/__health' || path === '/__health') {
-    return json(200, {
+    const info = {
       ok: true,
       relay: 'edgeone-xray-relay/edge',
       runtime: typeof caches === 'undefined' ? 'unknown' : 'worker',
@@ -92,7 +92,31 @@ async function handle(context) {
       seenPath: inUrl.pathname,
       forwardedPath: path,
       clientIp: context.clientIp || null,
-    });
+    };
+    // ?check=1 时真实探测一次后端连通性（GET 后端根路径，只报告状态码与耗时，不返回内容）
+    if (inUrl.searchParams.get('check') === '1') {
+      if (!origin) {
+        info.upstreamCheck = { ok: false, error: 'UPSTREAM 未配置' };
+      } else {
+        const t0 = Date.now();
+        try {
+          const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined;
+          const probeHeaders = new Headers();
+          const fakeHostProbe = getEnv(context, 'HOST');
+          if (fakeHostProbe) probeHeaders.set('host', fakeHostProbe);
+          const probe = await fetch(origin + '/', { method: 'GET', headers: probeHeaders, redirect: 'manual', signal });
+          info.upstreamCheck = {
+            ok: true,
+            status: probe.status,
+            contentType: probe.headers.get('content-type') || null,
+            ms: Date.now() - t0,
+          };
+        } catch (e) {
+          info.upstreamCheck = { ok: false, error: String((e && e.message) || e), ms: Date.now() - t0 };
+        }
+      }
+    }
+    return json(200, info);
   }
 
   if (!origin) {
